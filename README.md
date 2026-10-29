@@ -10,7 +10,7 @@ Open `index.html` in a browser, or serve it over HTTPS (phones only allow microp
 python3 -m http.server   # then open http://localhost:8000
 ```
 
-When hosted with GitHub Pages, it is available at `https://<user>.github.io/gyroball-rpm/`.
+**Live app:** [https://berkenbu.github.io/gyroball-rpm/](https://berkenbu.github.io/gyroball-rpm/) (hosted on GitHub Pages, so the microphone works on phones).
 
 Hold the phone a few centimetres from the ball in a quiet room and press **Start microphone**. **Simulated test** runs a synthetic sweep so you can check the display without a ball.
 
