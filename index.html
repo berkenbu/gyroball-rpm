@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gyro Ball RPM</title>
+<style>
+  :root {
+    --bg: #101418; --panel: #1a2027; --text: #e6edf3; --dim: #8b98a5;
+    --accent: #3fb9ff; --good: #4cd964; --warn: #ffb020; --grid: #2a333d;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 16px/1.4 -apple-system, system-ui, Segoe UI, Roboto, sans-serif; }
+  main { max-width: 900px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 18px; margin: 0 0 12px; font-weight: 600; }
+  .panel { background: var(--panel); border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+  #rpm { font-size: 72px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1; }
+  #rpm.off { color: var(--dim); }
+  .sub { color: var(--dim); font-size: 14px; margin-top: 6px; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  button { background: var(--accent); color: #00131f; border: 0; border-radius: 8px;
+           padding: 10px 16px; font-size: 16px; font-weight: 600; cursor: pointer; }
+  button.secondary { background: #2b3540; color: var(--text); }
+  button:disabled { opacity: .5; }
+  label { font-size: 14px; color: var(--dim); display: flex; flex-direction: column; gap: 4px; }
+  select, input[type=number] { background: #0e1216; color: var(--text); border: 1px solid var(--grid);
+           border-radius: 6px; padding: 7px; font-size: 15px; width: 110px; }
+  canvas { width: 100%; display: block; border-radius: 8px; background: #0b0f13; }
+  #conf { height: 6px; background: #0b0f13; border-radius: 3px; margin-top: 10px; overflow: hidden; }
+  #confbar { height: 100%; width: 0; background: var(--good); transition: width .15s; }
+  #msg { color: var(--warn); font-size: 14px; min-height: 20px; }
+  .help { font-size: 13px; color: var(--dim); }
+  .help li { margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Gyro Ball RPM from Sound</h1>
+
+  <div class="panel">
+    <div id="rpm" class="off">—</div>
+    <div class="sub"><span id="hz">— Hz</span> · max <span id="maxrpm">—</span> rpm · <span id="harm"></span></div>
+    <div id="conf"><div id="confbar"></div></div>
+  </div>
+
+  <div class="panel row">
+    <button id="start">Start microphone</button>
+    <button id="demo" class="secondary">Simulated test</button>
+    <button id="resetmax" class="secondary">Reset max</button>
+    <div id="msg"></div>
+  </div>
+
+  <div class="panel">
+    <div class="sub" style="margin:0 0 6px">Spectrum (dB above local noise floor) – lines mark the detected fundamental and harmonics</div>
+    <canvas id="spec" height="220"></canvas>
+  </div>
+
+  <div class="panel">
+    <div class="sub" style="margin:0 0 6px">RPM history (60 s)</div>
+    <canvas id="hist" height="140"></canvas>
+  </div>
+
+  <div class="panel row">
+    <label>Min rpm <input type="number" id="lo" value="2000" step="500" min="500"></label>
+    <label>Max rpm <input type="number" id="hi" value="12000" step="500" max="20000"></label>
+    <label>Mode
+      <select id="mode">
+        <option value="auto">Auto (harmonics)</option>
+        <option value="1">Strongest peak = 1×</option>
+        <option value="2">Strongest peak = 2×</option>
+        <option value="3">Strongest peak = 3×</option>
+        <option value="4">Strongest peak = 4×</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="panel help">
+    <ul>
+      <li>3,000–10,000 rpm is a rotation frequency of 50–167 Hz. The ball makes tones at that frequency and at multiples of it (harmonics).</li>
+      <li>Phone microphones are weak below ~100 Hz, so the fundamental may be faint. <b>Auto</b> mode scores each candidate speed by how well it explains the peaks at 1×, 2×, 3×… and is usually right even if the fundamental is missing.</li>
+      <li>If the reading jumps by a whole factor (half or double), choose a fixed mode instead.</li>
+      <li>Hold the phone close to the ball in a quiet room. Echo cancellation, noise suppression and auto gain are switched off. The mic needs HTTPS (or localhost) on a phone.</li>
+    </ul>
+  </div>
+</main>
+
+<script>
+"use strict";
+const FFT = 32768;           // ~1.5 Hz bins at 48 kHz → ~0.7 s window
+const MAXHZ = 1500;          // only analyse below this
+const NHARM = 8;
+const $ = id => document.getElementById(id);
+
+let ac = null, analyser = null, db = null, binHz = 0, running = false, stream = null, demoNodes = null;
+let history = [];            // {t, rpm}
+let recent = [];             // for median smoothing
+let maxRpm = 0;
+let last = null;             // last analysis for drawing
+
+function setMsg(s) { $("msg").textContent = s || ""; }
+
+async function ensureContext() {
+  if (!ac) ac = new (window.AudioContext || window.webkitAudioContext)();
+  if (ac.state === "suspended") await ac.resume();
+  analyser = ac.createAnalyser();
+  analyser.fftSize = FFT;
+  analyser.smoothingTimeConstant = 0.5;
+  db = new Float32Array(analyser.frequencyBinCount);
+  binHz = ac.sampleRate / FFT;
+}
+
+function stopAll() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null;
+  if (demoNodes) { demoNodes.stop(); demoNodes = null; }
+  running = false;
+  $("start").textContent = "Start microphone";
+  $("demo").textContent = "Simulated test";
+}
+
+$("start").onclick = async () => {
+  if (running) { stopAll(); return; }
+  try {
+    await ensureContext();
+    stream = await navigator.mediaDevices.getUserMedia({ audio: {
+      echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 } });
+    ac.createMediaStreamSource(stream).connect(analyser);
+    running = true; setMsg("");
+    $("start").textContent = "Stop";
+    loop();
+  } catch (e) {
+    setMsg("Microphone unavailable: " + e.message + (location.protocol === "file:" ? "" : ""));
+  }
+};
+
+// Synthetic ball: harmonic tone sweeping 3000→9500 rpm and back, plus noise. Not sent to speakers.
+$("demo").onclick = async () => {
+  if (running) { stopAll(); return; }
+  await ensureContext();
+  const oscs = [], now = ac.currentTime;
+  const mix = ac.createGain(); mix.gain.value = 0.2; mix.connect(analyser);
+  [1, 2, 3, 4, 5].forEach(k => {
+    const o = ac.createOscillator(), g = ac.createGain();
+    g.gain.value = [0.15, 1, 0.6, 0.4, 0.2][k - 1];   // weak fundamental, like a phone mic
+    o.frequency.setValueAtTime(50 * k, now);
+    for (let i = 0; i < 6; i++) {
+      o.frequency.linearRampToValueAtTime(k * (i % 2 ? 50 : 158), now + 15 * (i + 1));
+    }
+    o.connect(g); g.connect(mix); o.start();
+    oscs.push(o);
+  });
+  const nb = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate), d = nb.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * 0.3;
+  const ns = ac.createBufferSource(); ns.buffer = nb; ns.loop = true; ns.connect(mix); ns.start();
+  demoNodes = { stop() { oscs.forEach(o => o.stop()); ns.stop(); } };
+  running = true; setMsg("Simulated sweep 3,000 ↔ 9,500 rpm (no sound played).");
+  $("demo").textContent = "Stop test";
+  loop();
+};
+
+$("resetmax").onclick = () => { maxRpm = 0; $("maxrpm").textContent = "—"; history = []; };
+
+/* ---------- analysis ---------- */
+
+// parabolic interpolation around bin i → fractional bin
+function interp(a, i) {
+  const y0 = a[i - 1], y1 = a[i], y2 = a[i + 1];
+  const den = y0 - 2 * y1 + y2;
+  return den === 0 ? i : i + 0.5 * (y0 - y2) / den;
+}
+
+function analyse() {
+  analyser.getFloatFrequencyData(db);
+  const nb = Math.min(db.length - 1, Math.floor(MAXHZ / binHz));
+  const W = 40;
+  // moving average of dB as noise-floor estimate
+  const pre = new Float64Array(nb + 2);
+  for (let i = 0; i <= nb; i++) pre[i + 1] = pre[i] + (isFinite(db[i]) ? db[i] : -140);
+  const ex = new Float32Array(nb + 1);
+  for (let i = 0; i <= nb; i++) {
+    const a = Math.max(0, i - W), b = Math.min(nb, i + W);
+    ex[i] = (isFinite(db[i]) ? db[i] : -140) - (pre[b + 1] - pre[a]) / (b - a + 1);
+  }
+
+  const lo = Math.max(500, +$("lo").value || 2000) / 60;
+  const hi = Math.min(20000, +$("hi").value || 12000) / 60;
+  const mode = $("mode").value;
+  const maxExAt = (hz, tolBins) => {          // strongest excess near hz
+    const c = Math.round(hz / binHz);
+    let best = -99, bi = -1;
+    for (let i = Math.max(2, c - tolBins); i <= Math.min(nb - 1, c + tolBins); i++)
+      if (ex[i] > best) { best = ex[i]; bi = i; }
+    return { ex: best, bin: bi };
+  };
+
+  let f0 = 0, score = 0, harmonics = [];
+
+  if (mode === "auto") {
+    let bestF = 0, bestS = 0;
+    for (let f = lo; f <= hi; f += 0.2) {
+      let s = 0;
+      for (let k = 1; k <= NHARM && k * f < MAXHZ; k++) {
+        const tol = Math.max(1, Math.round(k * f * 0.008 / binHz));
+        const m = maxExAt(k * f, tol);
+        s += Math.max(0, Math.min(m.ex, 30) - 5) / (1 + 0.08 * (k - 1));
+      }
+      if (s > bestS) { bestS = s; bestF = f; }
+    }
+    f0 = bestF; score = bestS;
+  } else {
+    const N = +mode;
+    const m = { ex: -99, bin: -1 };
+    for (let i = Math.floor(lo * N / binHz); i <= Math.ceil(hi * N / binHz) && i < nb; i++)
+      if (i > 2 && ex[i] > m.ex) { m.ex = ex[i]; m.bin = i; }
+    if (m.bin > 0) { f0 = interp(db, m.bin) * binHz / N; score = Math.max(0, m.ex - 5) * 1.5; }
+  }
+
+  // refine f0 using each matched harmonic's interpolated peak frequency
+  if (f0 > 0 && score > 0) {
+    let num = 0, den = 0;
+    for (let k = 1; k <= NHARM && k * f0 < MAXHZ; k++) {
+      const tol = Math.max(1, Math.round(k * f0 * 0.008 / binHz));
+      const m = maxExAt(k * f0, tol);
+      if (m.ex > 6 && m.bin > 1) {
+        const fk = interp(db, m.bin) * binHz;
+        num += (fk / k) * m.ex; den += m.ex;
+        harmonics.push(k);
+      }
+    }
+    if (den > 0 && mode === "auto") f0 = num / den;
+  }
+
+  return { ex, nb, f0, score, harmonics, lo, hi };
+}
+
+/* ---------- main loop ---------- */
+
+function loop() {
+  if (!running) return;
+  const r = analyse();
+  const valid = r.f0 > 0 && r.score >= 8 && r.harmonics.length > 0;
+  let rpm = null;
+  if (valid) {
+    recent.push(r.f0 * 60);
+    if (recent.length > 7) recent.shift();
+    const s = [...recent].sort((a, b) => a - b);
+    rpm = s[s.length >> 1];
+  } else {
+    recent = [];
+  }
+  r.rpm = rpm; last = r;
+
+  const el = $("rpm");
+  if (rpm) {
+    el.textContent = Math.round(rpm).toLocaleString();
+    el.classList.remove("off");
+    $("hz").textContent = (rpm / 60).toFixed(1) + " Hz";
+    $("harm").textContent = "harmonics: " + r.harmonics.join(", ") + "×";
+    if (rpm > maxRpm) { maxRpm = rpm; $("maxrpm").textContent = Math.round(maxRpm).toLocaleString(); }
+    history.push({ t: performance.now(), rpm });
+  } else {
+    el.textContent = "—"; el.classList.add("off");
+    $("hz").textContent = "— Hz"; $("harm").textContent = "no clear signal";
+  }
+  $("confbar").style.width = Math.min(100, r.score / 80 * 100) + "%";
+  const cut = performance.now() - 60000;
+  while (history.length && history[0].t < cut) history.shift();
+
+  drawSpectrum(r);
+  drawHistory();
+  requestAnimationFrame(loop);
+}
+
+/* ---------- drawing ---------- */
+
+function setup(c) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight || parseInt(c.getAttribute("height"));
+  if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
+    c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+  }
+  const g = c.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  return { g, w, h };
+}
+
+function drawSpectrum(r) {
+  const { g, w, h } = setup($("spec"));
+  const XMAX = 600, YMAX = 50, padB = 28;
+  const X = hz => hz / XMAX * w, Y = d => (h - padB) - Math.max(0, Math.min(YMAX, d)) / YMAX * (h - padB - 6);
+
+  // allowed band
+  g.fillStyle = "rgba(63,185,255,0.07)";
+  g.fillRect(X(r.lo), 0, X(r.hi) - X(r.lo), h - padB);
+
+  // grid + labels
+  g.strokeStyle = "#2a333d"; g.fillStyle = "#8b98a5"; g.font = "11px system-ui"; g.lineWidth = 1;
+  g.textAlign = "center";
+  for (let hz = 0; hz <= XMAX; hz += 100) {
+    g.beginPath(); g.moveTo(X(hz), 0); g.lineTo(X(hz), h - padB); g.stroke();
+    g.fillText(hz + " Hz", Math.min(w - 22, Math.max(18, X(hz))), h - 15);
+    g.fillText((hz * 60 / 1000) + "k rpm", Math.min(w - 26, Math.max(22, X(hz))), h - 3);
+  }
+
+  // harmonic markers
+  if (r.rpm) {
+    const f0 = r.rpm / 60;
+    g.strokeStyle = "rgba(76,217,100,0.7)"; g.setLineDash([4, 4]);
+    for (let k = 1; k * f0 <= XMAX; k++) {
+      g.beginPath(); g.moveTo(X(k * f0), 0); g.lineTo(X(k * f0), h - padB); g.stroke();
+      g.fillStyle = "#4cd964"; g.textAlign = "left"; g.fillText(k + "×", X(k * f0) + 2, 11);
+    }
+    g.setLineDash([]);
+  }
+
+  // spectrum
+  g.strokeStyle = "#3fb9ff"; g.lineWidth = 1.2; g.beginPath();
+  let started = false;
+  for (let i = 1; i <= r.nb; i++) {
+    const hz = i * binHz;
+    if (hz > XMAX) break;
+    const x = X(hz), y = Y(r.ex[i]);
+    if (!started) { g.moveTo(x, y); started = true; } else g.lineTo(x, y);
+  }
+  g.stroke();
+}
+
+function drawHistory() {
+  const { g, w, h } = setup($("hist"));
+  const padL = 44, padB = 4;
+  const hi = Math.max(12000, Math.ceil(maxRpm / 2000) * 2000);
+  const Y = v => (h - padB) - v / hi * (h - padB - 6);
+  g.strokeStyle = "#2a333d"; g.fillStyle = "#8b98a5"; g.font = "11px system-ui"; g.textAlign = "right";
+  for (let v = 0; v <= hi; v += 2000) {
+    g.beginPath(); g.moveTo(padL, Y(v)); g.lineTo(w, Y(v)); g.stroke();
+    g.fillText(v / 1000 + "k", padL - 6, Y(v) + 4);
+  }
+  const now = performance.now();
+  g.strokeStyle = "#4cd964"; g.lineWidth = 2; g.beginPath();
+  let pen = false, prevT = 0;
+  for (const p of history) {
+    const x = padL + (1 - (now - p.t) / 60000) * (w - padL), y = Y(p.rpm);
+    if (!pen || p.t - prevT > 500) g.moveTo(x, y); else g.lineTo(x, y);
+    pen = true; prevT = p.t;
+  }
+  g.stroke();
+}
+
+window.addEventListener("resize", () => { if (last) { drawSpectrum(last); drawHistory(); } });
+if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+  setMsg("This browser/page can't access the microphone (needs HTTPS or localhost).");
+</script>
+</body>
+</html>
