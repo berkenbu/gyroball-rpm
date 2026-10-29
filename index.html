@@ -41,6 +41,7 @@
   <div class="panel">
     <div id="rpm" class="off">—</div>
     <div class="sub"><span id="hz">— Hz</span> · max <span id="maxrpm">—</span> rpm · <span id="harm"></span></div>
+    <div class="sub">Revolutions: <b id="revs" style="color:var(--text)">0</b> · spinning <span id="spint">0:00</span></div>
     <div id="conf"><div id="confbar"></div></div>
   </div>
 
@@ -48,6 +49,7 @@
     <button id="start">Start microphone</button>
     <button id="demo" class="secondary">Simulated test</button>
     <button id="resetmax" class="secondary">Reset max</button>
+    <button id="resetrevs" class="secondary">Reset counter</button>
     <div id="msg"></div>
   </div>
 
@@ -105,6 +107,7 @@ let ac = null, analyser = null, db = null, binHz = 0, running = false, stream = 
 let history = [];            // {t, rpm}
 const filt = { x: null, v: 0, tLast: 0, tAccept: 0, rejectSince: 0 };   // tracking filter state
 let maxRpm = 0;
+let revs = 0, spinSec = 0, lastCountT = null;   // session revolution counter
 let last = null;             // last analysis for drawing
 
 function setMsg(s) { $("msg").textContent = s || ""; }
@@ -122,6 +125,7 @@ async function ensureContext() {
 function stopAll() {
   if (stream) stream.getTracks().forEach(t => t.stop());
   stream = null;
+  lastCountT = null;
   if (demoNodes) { demoNodes.stop(); demoNodes = null; }
   running = false;
   $("start").textContent = "Start microphone";
@@ -169,6 +173,13 @@ $("demo").onclick = async () => {
 };
 
 $("resetmax").onclick = () => { maxRpm = 0; $("maxrpm").textContent = "—"; history = []; };
+
+function showRevs() {
+  $("revs").textContent = Math.floor(revs).toLocaleString();
+  const s = Math.floor(spinSec);
+  $("spint").textContent = Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+$("resetrevs").onclick = () => { revs = 0; spinSec = 0; showRevs(); };
 
 /* ---------- analysis ---------- */
 
@@ -301,6 +312,13 @@ function loop() {
   const out = filterStep(z, now);
   const rpm = out ? out.rpm : null;
   r.rpm = rpm; last = r;
+
+  // integrate rpm over time while the ball is being tracked
+  if (rpm) {
+    const dtc = lastCountT === null ? 0 : Math.min(0.2, (now - lastCountT) / 1000);
+    revs += rpm / 60 * dtc; spinSec += dtc; lastCountT = now;
+  } else lastCountT = null;
+  showRevs();
 
   const el = $("rpm");
   if (rpm) {

@@ -14,6 +14,8 @@ python3 -m http.server   # then open http://localhost:8000
 
 Hold the phone a few centimetres from the ball in a quiet room and press **Start microphone**. **Simulated test** runs a synthetic sweep so you can check the display without a ball.
 
+The **Revolutions** counter integrates the (filtered) rpm over time whenever the ball is being tracked, and keeps running across stop/start until you press **Reset counter**. It also shows the total time spent spinning.
+
 ## How it works
 
 - Rotation speed in Hz is rpm / 60, so 3,000–10,000 rpm is 50–167 Hz.
