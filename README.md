@@ -22,6 +22,10 @@ Hold the phone a few centimetres from the ball in a quiet room and press **Start
 - **Auto mode** scores every candidate speed by how well it explains peaks at 1×, 2×, … 8× (weak fundamentals are common because phone mics roll off below ~100 Hz). The best candidate is refined with parabolic peak interpolation across its matched harmonics, then median-smoothed.
 - **Fixed modes** treat the strongest peak in range as the 1×–4× harmonic. Use them if Auto reads half or double the true speed.
 
+## Filtering
+
+Raw readings go through an alpha-beta tracking filter (rpm and rpm/s) with a physical constraint: the ball's acceleration is assumed to stay below **Max accel** (default 2,000 rpm/s²). A reading that is farther from the prediction than that allows is rejected and the display holds the prediction, which suppresses octave errors and noise spikes. If readings keep disagreeing for 1 s the filter re-acquires at the new value. **Smoothing** sets the time constant (Light 0.15 s, Medium 0.4 s, Heavy 1 s); *Off* shows raw readings. The history chart shows raw readings as grey dots and the filtered value as the green line.
+
 ## Limitations
 
 - Accuracy is limited by the FFT window (about 0.7 s), so fast speed changes are smoothed.

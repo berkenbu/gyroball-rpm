@@ -64,6 +64,15 @@
   <div class="panel row">
     <label>Min rpm <input type="number" id="lo" value="2000" step="500" min="500"></label>
     <label>Max rpm <input type="number" id="hi" value="12000" step="500" max="20000"></label>
+    <label>Smoothing
+      <select id="smooth">
+        <option value="0">Off (raw)</option>
+        <option value="0.15">Light</option>
+        <option value="0.4" selected>Medium</option>
+        <option value="1">Heavy</option>
+      </select>
+    </label>
+    <label>Max accel (rpm/s²) <input type="number" id="accel" value="2000" step="500" min="100"></label>
     <label>Mode
       <select id="mode">
         <option value="auto">Auto (harmonics)</option>
@@ -94,7 +103,7 @@ const $ = id => document.getElementById(id);
 
 let ac = null, analyser = null, db = null, binHz = 0, running = false, stream = null, demoNodes = null;
 let history = [];            // {t, rpm}
-let recent = [];             // for median smoothing
+const filt = { x: null, v: 0, tLast: 0, tAccept: 0, rejectSince: 0 };   // tracking filter state
 let maxRpm = 0;
 let last = null;             // last analysis for drawing
 
@@ -234,21 +243,63 @@ function analyse() {
   return { ex, nb, f0, score, harmonics, lo, hi };
 }
 
+/* ---------- tracking filter ---------- */
+
+// Alpha-beta tracker (position = rpm, velocity = rpm/s) with an acceleration limit.
+// Measurements that the ball could not physically have reached (given the max
+// acceleration) are rejected and the prediction coasts; this suppresses octave
+// jumps and noise spikes. z is the raw rpm, or null when there is no valid reading.
+function filterStep(z, now) {
+  const tau = +$("smooth").value;                          // time constant in s, 0 = off
+  const A = Math.max(100, +$("accel").value || 2000);      // max |d²rpm/dt²|
+  const f = filt;
+  const reset = zz => { f.x = zz; f.v = 0; f.tLast = f.tAccept = now; f.rejectSince = 0; };
+
+  if (tau <= 0) { f.x = null; return z === null ? null : { rpm: z, coast: false }; }
+  if (f.x === null) {
+    if (z === null) return null;
+    reset(z);
+    return { rpm: z, coast: false };
+  }
+
+  const dt = Math.min(0.2, (now - f.tLast) / 1000);
+  f.tLast = now;
+  f.x += f.v * dt;
+  const T = (now - f.tAccept) / 1000;                      // time since last accepted reading
+
+  if (z === null) {                                        // no signal: coast briefly, then drop
+    if (T > 0.7) { f.x = null; return null; }
+    return { rpm: f.x, coast: true };
+  }
+
+  // allowed deviation: fixed margin + motion possible under max accel (incl. ~0.35 s window lag)
+  const gate = 150 + 0.5 * A * (T + 0.35) ** 2;
+  if (Math.abs(z - f.x) > gate) {
+    if (!f.rejectSince) f.rejectSince = now;
+    if (now - f.rejectSince > 1000) { reset(z); return { rpm: z, coast: false }; }   // re-acquire
+    return { rpm: f.x, coast: true };
+  }
+
+  f.rejectSince = 0; f.tAccept = now;
+  const a = 1 - Math.exp(-dt / tau), b = a * a / (2 - a);
+  const res = z - f.x;
+  f.x += a * res;
+  const dv = b * res / Math.max(dt, 1e-3);
+  f.v += Math.max(-A * dt, Math.min(A * dt, dv));          // acceleration-limited velocity update
+  f.v = Math.max(-3000, Math.min(3000, f.v));
+  return { rpm: f.x, coast: false };
+}
+
 /* ---------- main loop ---------- */
 
 function loop() {
   if (!running) return;
   const r = analyse();
   const valid = r.f0 > 0 && r.score >= 8 && r.harmonics.length > 0;
-  let rpm = null;
-  if (valid) {
-    recent.push(r.f0 * 60);
-    if (recent.length > 7) recent.shift();
-    const s = [...recent].sort((a, b) => a - b);
-    rpm = s[s.length >> 1];
-  } else {
-    recent = [];
-  }
+  const now = performance.now();
+  const z = valid ? r.f0 * 60 : null;
+  const out = filterStep(z, now);
+  const rpm = out ? out.rpm : null;
   r.rpm = rpm; last = r;
 
   const el = $("rpm");
@@ -256,9 +307,9 @@ function loop() {
     el.textContent = Math.round(rpm).toLocaleString();
     el.classList.remove("off");
     $("hz").textContent = (rpm / 60).toFixed(1) + " Hz";
-    $("harm").textContent = "harmonics: " + r.harmonics.join(", ") + "×";
-    if (rpm > maxRpm) { maxRpm = rpm; $("maxrpm").textContent = Math.round(maxRpm).toLocaleString(); }
-    history.push({ t: performance.now(), rpm });
+    $("harm").textContent = out.coast ? "holding (reading rejected)" : "harmonics: " + r.harmonics.join(", ") + "×";
+    if (!out.coast && rpm > maxRpm) { maxRpm = rpm; $("maxrpm").textContent = Math.round(maxRpm).toLocaleString(); }
+    history.push({ t: now, rpm, raw: z });
   } else {
     el.textContent = "—"; el.classList.add("off");
     $("hz").textContent = "— Hz"; $("harm").textContent = "no clear signal";
@@ -338,6 +389,11 @@ function drawHistory() {
     g.fillText(v / 1000 + "k", padL - 6, Y(v) + 4);
   }
   const now = performance.now();
+  g.fillStyle = "rgba(139,152,165,0.45)";                  // raw readings
+  for (const p of history) {
+    if (p.raw == null) continue;
+    g.fillRect(padL + (1 - (now - p.t) / 60000) * (w - padL) - 1, Y(p.raw) - 1, 2, 2);
+  }
   g.strokeStyle = "#4cd964"; g.lineWidth = 2; g.beginPath();
   let pen = false, prevT = 0;
   for (const p of history) {
